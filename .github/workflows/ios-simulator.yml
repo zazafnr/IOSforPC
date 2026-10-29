@@ -1,0 +1,235 @@
+name: iOS-Simulator
+
+# Startet iPhone- und iPad-Simulatoren auf einem Mac in der Cloud und macht sie über die
+# PC-App »iOS-Simulator« bedienbar (Bild, Touch, Tastatur). Gestartet wird der Lauf von der
+# PC-App; die meisten Felder setzt sie selbst.
+#
+# Dieses Repo ist öffentlich, die App-Quellen liegen in einem privaten Repo. Deshalb:
+# - Die App wird mit dem Secret APP_REPO_TOKEN geholt (nur Lesezugriff auf das App-Repo).
+# - Build-Ausgaben landen nur auf dem Mac und in der PC-App, nicht im (öffentlichen) Protokoll.
+run-name: "iOS-Simulator ${{ inputs.session || 'Prüfung' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      session:
+        description: "Sitzungs-ID (setzt die PC-App)"
+        required: true
+        type: string
+      auth_hash:
+        description: "SHA-256 des Zugangsschlüssels (setzt die PC-App)"
+        required: true
+        type: string
+      devices:
+        description: "Geräte"
+        type: choice
+        options: [beide, iphone, ipad]
+        default: beide
+      ios:
+        description: "iOS-Version (27 = neueste, 26 = stabil)"
+        type: choice
+        options: ["27", "26"]
+        default: "27"
+      iphone_model:
+        description: "iPhone-Modell (auto = neuestes Pro)"
+        type: string
+        default: auto
+      ipad_model:
+        description: "iPad-Modell (auto = neuestes iPad Pro 13)"
+        type: string
+        default: auto
+      app_ref:
+        description: "App als »besitzer/repo:branch« (leer = leerer Simulator nur mit Apple-Apps)"
+        type: string
+        default: "zazafnr/notes:claude/chat-ios-notizbuch-ki-yx5ny3"
+      app_path:
+        description: "Projekt im App-Repo (auto = erstes .swiftpm/.xcodeproj)"
+        type: string
+        default: auto
+      minutes:
+        description: "Längste Dauer in Minuten"
+        type: string
+        default: "60"
+      settings:
+        description: "Profil-Einstellungen als JSON (language, locale, appearance)"
+        type: string
+        default: "{}"
+  push:
+    paths:
+      - "server/**"
+      - "runner/**"
+      - "test/server.test.js"
+      - ".github/workflows/ios-simulator.yml"
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  # Bei Änderungen an den Werkzeugen nur kurz auf Linux prüfen.
+  check:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Server und Skripte prüfen
+        run: |
+          for f in runner/*.sh; do bash -n "$f"; done
+          cd server
+          npm ci --no-audit --no-fund
+          for f in *.js; do node --check "$f"; done
+          node ../test/server.test.js
+
+  session:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ inputs.ios == '26' && 'macos-26' || 'xcode-27' }}
+    timeout-minutes: 200
+    env:
+      SIM_DIR: /tmp/sim
+      SESSION: ${{ inputs.session }}
+      AUTH_HASH: ${{ inputs.auth_hash }}
+      DEVICES: ${{ inputs.devices }}
+      IPHONE_MODEL: ${{ inputs.iphone_model }}
+      IPAD_MODEL: ${{ inputs.ipad_model }}
+      APP_PATH: ${{ inputs.app_path }}
+      MINUTES: ${{ inputs.minutes }}
+      LANGUAGE: ${{ fromJSON(inputs.settings).language || 'de-DE' }}
+      LOCALE: ${{ fromJSON(inputs.settings).locale || 'de_DE' }}
+      APPEARANCE: ${{ fromJSON(inputs.settings).appearance || 'light' }}
+      GH_TOKEN: ${{ github.token }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start melden
+        run: runner/status.sh pending "Cloud-Mac gestartet"
+
+      - name: Werkzeuge laden (im Hintergrund)
+        run: |
+          mkdir -p "$SIM_DIR"
+          ( brew install cameroncooke/axe/axe cloudflared > "$SIM_DIR/brew.log" 2>&1; echo $? > "$SIM_DIR/brew.done" ) &
+
+      - name: Neuestes Xcode wählen
+        id: xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          [ -z "$XC" ] && XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          echo "build=$(xcodebuild -version | tail -1 | awk '{print $NF}')" >> "$GITHUB_OUTPUT"
+
+      - name: App-Quelle bestimmen
+        id: app
+        env:
+          SOURCE: ${{ inputs.app_ref }}
+        run: |
+          if [ -z "$SOURCE" ]; then echo "Ohne eigene App"; exit 0; fi
+          case "$SOURCE" in
+            *:*) REPO="${SOURCE%%:*}"; REF="${SOURCE#*:}" ;;
+            *)   REPO="$GITHUB_REPOSITORY"; REF="$SOURCE" ;;
+          esac
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "APP_REF=$REF" >> "$GITHUB_ENV"
+
+      - name: App holen
+        id: checkout
+        if: steps.app.outputs.repo != ''
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.app.outputs.repo }}
+          ref: ${{ steps.app.outputs.ref }}
+          token: ${{ secrets.APP_REPO_TOKEN || github.token }}
+          path: app
+          fetch-depth: 1
+
+      - name: Simulatoren anlegen
+        run: |
+          if [ "${{ steps.checkout.outcome }}" = "failure" ]; then
+            echo "::warning::App-Repo nicht lesbar – fehlt das Secret APP_REPO_TOKEN? Simulator startet ohne eigene App."
+            runner/status.sh pending "App-Repo nicht lesbar (Secret APP_REPO_TOKEN?)"
+          fi
+          runner/status.sh pending "Lege Simulatoren an"
+          # Mit eigener App erst bauen, dann hochfahren (beides gleichzeitig bremst den Build stark).
+          NO_BOOT=$([ "${{ steps.checkout.outcome }}" = "success" ] && echo 1 || echo 0) runner/boot.sh
+
+      - name: App bauen
+        if: steps.checkout.outcome == 'success'
+        run: |
+          runner/status.sh pending "Baue die App"
+          # Ausgabe nur in die Datei auf dem Mac: das Protokoll dieses Repos ist öffentlich.
+          if APP_DIR="$GITHUB_WORKSPACE/app" APP_REF="" runner/build-app.sh > /dev/null 2>&1; then
+            echo "App gebaut"
+          else
+            echo "::warning::App ließ sich nicht bauen – Details in der PC-App (Build-Protokoll). Simulator startet trotzdem."
+          fi
+
+      - name: Auf Simulatoren warten
+        run: |
+          runner/status.sh pending "Starte iPhone/iPad"
+          runner/wait-boot.sh
+
+      - name: App installieren und öffnen
+        if: steps.checkout.outcome == 'success'
+        run: |
+          if [ ! -f "$SIM_DIR/app.json" ]; then echo "Keine gebaute App"; exit 0; fi
+          runner/status.sh pending "Installiere die App"
+          APP=$(python3 -c "import json;print(json.load(open('$SIM_DIR/app.json'))['path'])")
+          BUNDLE=$(python3 -c "import json;print(json.load(open('$SIM_DIR/app.json'))['bundle'])")
+          for udid in $(python3 -c "import json;print(' '.join(d['udid'] for d in json.load(open('$SIM_DIR/devices.json'))))"); do
+            xcrun simctl install "$udid" "$APP" && xcrun simctl launch "$udid" "$BUNDLE" > /dev/null || echo "::warning::Installation auf einem Gerät ging nicht"
+          done
+
+      - name: Werkzeuge prüfen
+        run: |
+          for i in $(seq 1 600); do [ -f "$SIM_DIR/brew.done" ] && break; sleep 1; done
+          [ "$(cat "$SIM_DIR/brew.done")" = "0" ] || { tail -20 "$SIM_DIR/brew.log"; echo "::error::Homebrew-Installation fehlgeschlagen"; exit 1; }
+          axe --version
+          cloudflared --version
+
+      - name: Video-Helfer aus dem Cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/sim/simhelper-cache
+          key: simhelper-${{ steps.xcode.outputs.build }}-${{ hashFiles('runner/simhelper.swift', 'runner/build-helper.sh') }}
+
+      - name: Video-Helfer bauen
+        run: runner/build-helper.sh || echo "::warning::simhelper fehlt – Bild über AXe-Einzelbilder"
+
+      - name: Bildschirme vermessen
+        run: python3 runner/measure.py
+
+      - name: Sitzung öffnen
+        run: |
+          runner/status.sh pending "Verbinde"
+          APP_DIR="$GITHUB_WORKSPACE/app" runner/start-session.sh
+
+      - name: Selbsttest
+        if: fromJSON(inputs.settings).selftest
+        env:
+          SELFTEST_TOKEN: ${{ fromJSON(inputs.settings).selftest }}
+        run: |
+          node test/live-check.js || true
+          curl -fsS -X POST -H "Authorization: Bearer $SELFTEST_TOKEN" http://127.0.0.1:8787/api/shutdown || true
+
+      - name: Sitzung läuft
+        run: |
+          echo "Sitzung läuft. Beenden über die PC-App oder ›Cancel workflow‹."
+          PID=$(cat "$SIM_DIR/server.pid")
+          while kill -0 "$PID" 2>/dev/null; do sleep 10; done
+
+      - name: Ende melden
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            runner/status.sh failure "Sitzung beendet"
+          else
+            runner/status.sh error "Fehler beim Start – Details im GitHub-Lauf"
+          fi
