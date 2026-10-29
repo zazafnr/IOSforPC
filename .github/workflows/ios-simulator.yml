@@ -157,8 +157,21 @@ jobs:
             runner/status.sh pending "App-Repo nicht lesbar (Secret APP_REPO_TOKEN?)"
           fi
           runner/status.sh pending "Lege Simulatoren an"
-          # Mit eigener App erst bauen, dann hochfahren (beides gleichzeitig bremst den Build stark).
-          NO_BOOT=$([ "${{ steps.checkout.outcome }}" = "success" ] && echo 1 || echo 0) runner/boot.sh
+          # Nur anlegen; hochgefahren wird nach dem App-Build (beides gleichzeitig bremst den Build stark).
+          NO_BOOT=1 runner/boot.sh
+          echo "key=$(runner/device-cache.sh key)" >> "$GITHUB_OUTPUT"
+        id: sims
+
+      - name: Eingerichtete Simulatoren aus dem Cache
+        id: simcache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/sim/devcache
+          key: ${{ steps.sims.outputs.key }}
+
+      - name: Eingerichtete Simulatoren übernehmen
+        if: steps.simcache.outputs.cache-hit == 'true'
+        run: runner/device-cache.sh restore
 
       - name: App bauen
         if: steps.checkout.outcome == 'success'
@@ -175,6 +188,22 @@ jobs:
         run: |
           runner/status.sh pending "Starte iPhone/iPad"
           runner/wait-boot.sh
+
+      # Erster Start mit diesen Modellen: eingerichteten Stand für die nächsten Sitzungen merken.
+      # Das passiert vor der App-Installation, damit nichts von der App in den (öffentlichen) Cache kommt.
+      - name: Eingerichtete Simulatoren merken
+        if: steps.simcache.outputs.cache-hit != 'true'
+        run: |
+          runner/status.sh pending "Merke eingerichtete Simulatoren für nächstes Mal"
+          runner/device-cache.sh save
+
+      - name: Eingerichtete Simulatoren speichern
+        if: steps.simcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/sim/devcache
+          key: ${{ steps.sims.outputs.key }}
 
       - name: App installieren und öffnen
         if: steps.checkout.outcome == 'success'

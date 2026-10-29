@@ -17,6 +17,4 @@ for udid in $UDIDS; do
   xcrun simctl spawn "$udid" defaults write -g AppleLocale -string "$LOCALE" || true
 done
 
-# Simulator.app wird nur zum Drehen gebraucht (Menü »Device → Orientation«).
-open -a Simulator || echo "Simulator.app nicht gefunden – Drehen ist in dieser Sitzung nicht möglich"
 echo "Simulatoren bereit"
