@@ -192,18 +192,11 @@ jobs:
       # Erster Start mit diesen Modellen: eingerichteten Stand für die nächsten Sitzungen merken.
       # Das passiert vor der App-Installation, damit nichts von der App in den (öffentlichen) Cache kommt.
       - name: Eingerichtete Simulatoren merken
+        id: devsave
         if: steps.simcache.outputs.cache-hit != 'true'
         run: |
           runner/status.sh pending "Merke eingerichtete Simulatoren für nächstes Mal"
           runner/device-cache.sh save
-
-      - name: Eingerichtete Simulatoren speichern
-        if: steps.simcache.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: /tmp/sim/devcache
-          key: ${{ steps.sims.outputs.key }}
 
       - name: App installieren und öffnen
         if: steps.checkout.outcome == 'success'
@@ -253,6 +246,16 @@ jobs:
           echo "Sitzung läuft. Beenden über die PC-App oder ›Cancel workflow‹."
           PID=$(cat "$SIM_DIR/server.pid")
           while kill -0 "$PID" 2>/dev/null; do sleep 10; done
+
+      # Erst am Ende hochladen, damit niemand darauf warten muss. Die Kopie stammt von vor der
+      # App-Installation, enthält also nichts von der App.
+      - name: Eingerichtete Simulatoren speichern
+        if: always() && steps.simcache.outputs.cache-hit != 'true' && steps.devsave.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/sim/devcache
+          key: ${{ steps.sims.outputs.key }}
 
       - name: Ende melden
         if: always()
